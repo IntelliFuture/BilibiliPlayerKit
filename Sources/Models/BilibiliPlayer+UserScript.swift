@@ -2,7 +2,7 @@ import Foundation
 
 extension BilibiliPlayer {
     enum UserScript {
-        static func playbackBridge(showsNativeControls: Bool) -> String {
+        static func playbackBridge(showsNativeControls: Bool, sessionID: String = "") -> String {
             let hideNativeControls = showsNativeControls ? "false" : "true"
             return """
             (function () {
@@ -13,6 +13,7 @@ extension BilibiliPlayer {
 
                 const hideNativeControls = \(hideNativeControls);
                 const messageHandlerName = 'bilibiliPlayerKit';
+                const bridgeSessionID = '\(sessionID)';
 
                 function findVideo() {
                     return document.querySelector('video');
@@ -131,74 +132,7 @@ extension BilibiliPlayer {
                     }
                 }
 
-                function postStatus() {
-                    const video = findVideo();
-                    if (!video) {
-                        return;
-                    }
-                    prepareVideo(video);
-                    try {
-                        window.webkit.messageHandlers[messageHandlerName].postMessage({
-                            kind: 'status',
-                            currentTime: Number.isFinite(video.currentTime) ? video.currentTime : 0,
-                            duration: Number.isFinite(video.duration) ? video.duration : 0,
-                            paused: !!video.paused,
-                            ended: !!video.ended,
-                            readyState: video.readyState || 0
-                        });
-                    } catch (_) {}
-                }
-
-                function applyCommand(command) {
-                    const video = findVideo();
-                    if (!video || !command || command.type !== 'bilibili-player-kit-command') {
-                        return false;
-                    }
-                    prepareVideo(video);
-                    switch (command.command) {
-                    case 'play':
-                        video.play();
-                        break;
-                    case 'pause':
-                        video.pause();
-                        break;
-                    case 'seek':
-                        if (Number.isFinite(command.value) && command.value >= 0) {
-                            video.currentTime = command.value;
-                        }
-                        break;
-                    case 'stop':
-                        video.pause();
-                        video.currentTime = 0;
-                        break;
-                    case 'setMuted':
-                        video.muted = !!command.value;
-                        break;
-                    case 'setRate':
-                        if (Number.isFinite(command.value) && command.value > 0) {
-                            video.playbackRate = command.value;
-                        }
-                        break;
-                    default:
-                        return false;
-                    }
-                    postStatus();
-                    return true;
-                }
-
-                window.__bilibiliPlayerKitControl = applyCommand;
-                window.addEventListener('message', function (event) {
-                    applyCommand(event.data);
-                });
-
-                ['loadedmetadata', 'play', 'playing', 'pause', 'ended', 'timeupdate', 'ratechange', 'volumechange'].forEach(function (eventName) {
-                    document.addEventListener(eventName, function (event) {
-                        if (event.target && event.target.tagName === 'VIDEO') {
-                            prepareVideo(event.target);
-                            postStatus();
-                        }
-                    }, true);
-                });
+                \(confirmedPlaybackControl)
 
                 function leaveFullscreenIfNeeded() {
                     if (!hideNativeControls) {

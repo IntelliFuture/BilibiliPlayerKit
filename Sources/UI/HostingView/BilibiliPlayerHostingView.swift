@@ -8,6 +8,7 @@ public final class BilibiliPlayerHostingView: UIView {
     public let webView: WKWebView
 
     private var loadedURL: URL?
+    private var mediaFrame: WKFrameInfo?
     private let navigationDelegate = BilibiliPlayerNavigationDelegate()
     private let scriptMessageHandler: BilibiliPlayerScriptMessageHandler
 
@@ -23,7 +24,7 @@ public final class BilibiliPlayerHostingView: UIView {
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.userContentController.addUserScript(
             WKUserScript(
-                source: BilibiliPlayer.UserScript.playbackBridge(showsNativeControls: player.configuration.showsNativeControls),
+                source: BilibiliPlayer.UserScript.playbackBridge(showsNativeControls: player.configuration.showsNativeControls, sessionID: player.controlSessionID),
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: false
             )
@@ -44,11 +45,11 @@ public final class BilibiliPlayerHostingView: UIView {
         self.webView = WKWebView(frame: .zero, configuration: configuration)
         super.init(frame: .zero)
 
-        scriptMessageHandler.onSnapshot = { [weak player] snapshot in
-            player?.setPlaybackSnapshot(snapshot)
-            if player?.state == .loading {
-                player?.setState(.ready)
-            }
+        scriptMessageHandler.onSnapshot = { [weak self, weak player] snapshot, frame in
+            guard let self, let player, snapshot.sessionID == player.controlSessionID else { return }
+            if snapshot.readyState >= 1 { self.mediaFrame = frame }
+            guard player.receivePlaybackSnapshot(snapshot) else { return }
+            if player.state == .loading, snapshot.readyState >= 1 { player.setState(.ready) }
         }
         setUpWebView()
         bindPlayer()
@@ -82,9 +83,8 @@ public final class BilibiliPlayerHostingView: UIView {
             webView.customUserAgent = customUserAgent
         }
 
-        navigationDelegate.onReady = { [weak player] in
-            player?.setState(.ready)
-        }
+        // Navigation completion is not media readiness. Metadata from the actual
+        // video frame confirms readiness through onSnapshot above.
         navigationDelegate.onError = { [weak player] error in
             player?.setState(.error(.navigationFailed(error.localizedDescription)))
         }
@@ -106,21 +106,44 @@ public final class BilibiliPlayerHostingView: UIView {
         player.stopLoadingHandler = { [weak self] in
             self?.webView.stopLoading()
             self?.loadedURL = nil
+            self?.mediaFrame = nil
         }
-        player.evaluateJavaScriptHandler = { [weak self] script in
-            guard let self else {
+        player.evaluateJavaScriptHandler = { [weak self, weak player] script in
+            guard let self, let player else {
                 throw BilibiliPlayer.PlayerError.webViewUnavailable
             }
-            return try await self.webView.evaluateJavaScript(script)
+            let sessionID = player.controlSessionID
+            let deadline = ProcessInfo.processInfo.systemUptime + 10
+            while self.mediaFrame == nil {
+                try Task.checkCancellation()
+                guard player.controlSessionID == sessionID else { throw CancellationError() }
+                guard ProcessInfo.processInfo.systemUptime < deadline else {
+                    throw BilibiliPlayer.PlayerError.unsupportedIframeControl
+                }
+                try await Task.sleep(nanoseconds: 25_000_000)
+            }
+            guard player.controlSessionID == sessionID else { throw CancellationError() }
+            return try await self.webView.callAsyncJavaScript(script, arguments: [:],
+                in: self.mediaFrame, contentWorld: .page)
         }
     }
 
     private func load(_ url: URL) {
-        guard loadedURL != url else {
-            player.setState(.ready)
-            return
-        }
         loadedURL = url
+        mediaFrame = nil
+        // Every document/frame carries this load's identity, so old messages
+        // cannot configure or publish progress into a replacement source.
+        let scripts = webView.configuration.userContentController
+        scripts.removeAllUserScripts()
+        scripts.addUserScript(WKUserScript(
+            source: BilibiliPlayer.UserScript.playbackBridge(
+                showsNativeControls: player.configuration.showsNativeControls,
+                sessionID: player.controlSessionID),
+            injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        if player.configuration.preferAVCPlayback {
+            scripts.addUserScript(WKUserScript(source: BilibiliPlayer.UserScript.preferAVCPlayback,
+                injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
         switch player.parameters.embedMode {
         case .iframeHTML:
             let html = BilibiliPlayer.HTMLBuilder().html(
@@ -138,7 +161,7 @@ public final class BilibiliPlayerHostingView: UIView {
 private final class BilibiliPlayerScriptMessageHandler: NSObject, WKScriptMessageHandler {
     nonisolated static let name = "bilibiliPlayerKit"
 
-    var onSnapshot: ((BilibiliPlayer.PlaybackSnapshot) -> Void)?
+    var onSnapshot: ((BilibiliPlayer.PlaybackSnapshot, WKFrameInfo) -> Void)?
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard message.name == Self.name,
@@ -157,8 +180,16 @@ private final class BilibiliPlayerScriptMessageHandler: NSObject, WKScriptMessag
             duration: duration,
             isPaused: isPaused,
             isEnded: isEnded,
-            readyState: readyState
-        ))
+            readyState: readyState,
+            rawCurrentTime: (body["rawCurrentTime"] as? NSNumber)?.doubleValue,
+            loopBoundaryTime: (body["loopBoundaryTime"] as? NSNumber)?.doubleValue,
+            isSeeking: Self.boolValue(body["seeking"], defaultValue: false),
+            isLoopTransition: Self.boolValue(body["loopTransition"], defaultValue: false),
+            playbackError: body["playbackError"] as? String,
+            sessionID: body["sessionID"] as? String,
+            commandRevision: Self.intValue(body["revision"]),
+            sequence: Self.intValue(body["sequence"])
+        ), message.frameInfo)
     }
 
     private static func doubleValue(_ value: Any?) -> Double {
